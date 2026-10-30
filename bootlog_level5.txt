@@ -1,0 +1,12 @@
+tVolume 60
+[2827]start display ...
+[2827]get current firmware 0x0001041c
+[2828]get resolution setting 0x01
+[2829]oled resume ...
+[2839][1] switch resolution 0 to 1 (1920x1080_60Hz)
+[3032][1] oled color temp 0xf114
+[3034][2] switch resolution 0 to 1 (1920x1080_60Hz)
+[3226][2] oled color temp 0xf114
+[3237]oled brightness 80 - 240
+[3239]spi [1] read reg 0x10, reserve value 0x00 0x0f
+[3247]spi [2] read reg 0x10, reserve value 0x00 0x0f

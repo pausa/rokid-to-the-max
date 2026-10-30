@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""rokid-temp - control Rokid Max (plain, 04d2:162f) OLED color temperature.
+
+Works via the glasses' CDC-ACM debug shell ("bayou"), writing panel SPI
+register 0x3c (color temp low byte; 0x3b stays 0xf1) on both eye panels
+(CS1=left, CS2=right).
+
+Calibration (live-verified, side-by-side A/B):
+    neutral  0x14 (20)   stock tint - judged most comfortable
+    warm     0x08        slightly warm (0x00 = stronger but looked odd)
+    cool     0x20        slightly cool (0x40 = strong cool)
+
+Higher 0x3c = cooler (bluer), lower = warmer.
+
+Usage: rokid-temp [warm|neutral|cool|0xNN|dec]
+
+Requirements: glasses worn (Psensor sleeps panels otherwise), /dev/ttyACM0
+owned by the Rokid Max, user has rw permission.
+"""
+import re
+import sys
+import time
+
+import serial  # pyserial
+
+PORT = "/dev/ttyACM0"
+REG = "0x3c"
+REG3B = "0xf1"  # high byte, held at default
+CS = ("1", "2")  # left, right
+
+PRESETS = {
+    "warm": 0x08,
+    "neutral": 0x14,
+    "cool": 0x20,
+}
+
+
+def die(msg):
+    print("error: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_arg(arg):
+    if arg in PRESETS:
+        return PRESETS[arg]
+    try:
+        v = int(arg, 0)
+    except ValueError:
+        die(f"unknown preset: {arg!r}; presets: {', '.join(PRESETS)}")
+    if not (0 <= v <= 255):
+        die("value must be 0-255")
+    return v
+
+
+class Shell:
+    def __init__(self):
+        self.s = serial.Serial(PORT, 115200, timeout=0.3)
+        time.sleep(1)
+        self.s.reset_input_buffer()
+
+    def cmd(self, c, maxwait=5):
+        self.s.reset_input_buffer()
+        self.s.write((c + "\r\n").encode())
+        deadline = time.time() + maxwait
+        out = b""
+        while time.time() < deadline:
+            chunk = self.s.read(4096)
+            if chunk:
+                out += chunk
+                if out.rstrip().endswith(b"bayou>"):
+                    break
+        return out.decode(errors="replace")
+
+    def read_reg(self, cs, reg):
+        r = self.cmd(f"spi-read {cs} {reg}")
+        m = re.search(r"reg %s, reserve value 0x00 0x([0-9a-f]+)" % reg, r)
+        return ("0x" + m.group(1)) if m else None
+
+    def write_both(self, val_hex):
+        for cs in CS:
+            self.cmd(f"spi-write {cs} 0x3b {REG3B}")
+            self.cmd(f"spi-write {cs} {REG} {val_hex}")
+        time.sleep(0.5)
+
+    def close(self):
+        self.s.close()
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(__doc__)
+        sys.exit(0)
+    val = parse_arg(sys.argv[1].lower())
+    val_hex = f"0x{val:02x}"
+
+    try:
+        sh = Shell()
+    except serial.SerialException as e:
+        die(f"cannot open {PORT}: {e}")
+
+    # wear-check: panels awake?
+    pre = (sh.read_reg("1", "0x3b"), sh.read_reg("1", "0x3c"))
+    if "0x00" in pre or None in pre:
+        sh.close()
+        die("panels read %s - glasses asleep or not worn; "
+            "PUT ON THE GLASSES and retry" % (pre,))
+    print(f"pre-check: 0x3b={pre[0]} 0x3c={pre[1]}")
+
+    sh.write_both(val_hex)
+    post_l, post_r = sh.read_reg("1", REG), sh.read_reg("2", REG)
+    ok = (post_l, post_r) == (val_hex, val_hex)
+    print(f"set {val_hex} ({val}): left={post_l} right={post_r} "
+          + ("OK" if ok else "MISMATCH - replug the glasses if tint looks "
+             "wrong"))
+    sh.close()
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

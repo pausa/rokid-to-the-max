@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""rokid-brightness - control Rokid Max (plain, 04d2:162f) OLED brightness.
+
+Works via the glasses' CDC-ACM debug shell ("bayou"), writing panel SPI
+register 0x13 (brightness) on both eye panels (CS1=left, CS2=right).
+
+Presets (calibrated on-device):
+    desktop  0x80 (128)   general desktop use
+    night    0x20 (32)    dark rooms (below the driver's documented floor
+                          of 80 - works, verified live)
+    outdoor  0xf0 (240)   max brightness (boot default)
+    max      0xf0
+    restore  0xf0         firmware default
+
+Usage: rokid-brightness [desktop|night|outdoor|max|restore|0xNN|dec]
+
+Requirements: glasses worn (Psensor sleeps panels otherwise), /dev/ttyACM0
+owned by the Rokid Max, user has rw permission.
+"""
+import re
+import sys
+import time
+
+import serial  # pyserial
+
+PORT = "/dev/ttyACM0"
+VID, PID = 0x04D2, 0x162F
+REG = "0x13"
+CS = ("1", "2")  # left, right
+
+PRESETS = {
+    "desktop": 0x80,
+    "night": 0x20,
+    "outdoor": 0xF0,
+    "max": 0xF0,
+    "restore": 0xF0,
+}
+
+
+def die(msg):
+    print("error: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_arg(arg):
+    if arg in PRESETS:
+        return PRESETS[arg]
+    try:
+        v = int(arg, 0)  # 0xNN or decimal
+    except ValueError:
+        die(f"unknown level/preset: {arg!r}; presets: {', '.join(PRESETS)}")
+    if not (0 <= v <= 255):
+        die("level must be 0-255")
+    if v < 32 or v > 240:
+        print(f"warning: {v} is outside tested range 32-240")
+    return v
+
+
+class Shell:
+    def __init__(self):
+        self.s = serial.Serial(PORT, 115200, timeout=0.3)
+        time.sleep(1)
+        self.s.reset_input_buffer()
+
+    def cmd(self, c, maxwait=5):
+        self.s.reset_input_buffer()
+        self.s.write((c + "\r\n").encode())
+        deadline = time.time() + maxwait
+        out = b""
+        while time.time() < deadline:
+            chunk = self.s.read(4096)
+            if chunk:
+                out += chunk
+                if out.rstrip().endswith(b"bayou>"):
+                    break
+        return out.decode(errors="replace")
+
+    def read_reg(self, cs, reg=REG):
+        r = self.cmd(f"spi-read {cs} {reg}")
+        m = re.search(r"reg %s, reserve value 0x00 0x([0-9a-f]+)" % reg, r)
+        return ("0x" + m.group(1)) if m else None
+
+    def write_both(self, val_hex):
+        for cs in CS:
+            self.cmd(f"spi-write {cs} {REG} {val_hex}")
+        time.sleep(0.5)
+
+    def close(self):
+        self.s.close()
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(__doc__)
+        sys.exit(0)
+    val = parse_arg(sys.argv[1].lower())
+    val_hex = f"0x{val:02x}"
+
+    try:
+        sh = Shell()
+    except serial.SerialException as e:
+        die(f"cannot open {PORT}: {e}")
+
+    # wear-check: panels should be readable at a sane value before writing
+    pre_l, pre_r = sh.read_reg("1"), sh.read_reg("2")
+    if pre_l in (None, "0x00") or pre_r in (None, "0x00"):
+        sh.close()
+        die("panels read %s/%s - glasses asleep or not worn; "
+            "PUT ON THE GLASSES and retry" % (pre_l, pre_r))
+    print(f"pre-check: left={pre_l} right={pre_r}")
+
+    sh.write_both(val_hex)
+    post_l, post_r = sh.read_reg("1"), sh.read_reg("2")
+    ok = (post_l, post_r) == (val_hex, val_hex)
+    print(f"set {val_hex} ({val}): left={post_l} right={post_r} "
+          + ("OK" if ok else "MISMATCH - replug the glasses if display "
+             "looks wrong"))
+    sh.close()
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
