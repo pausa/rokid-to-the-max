@@ -300,6 +300,12 @@ The CLI does a wear-check first (panels read 0x00 when not worn), writes
 both eye panels, and verifies readback. Settings do not persist across
 replug (boot default is 0xf0).
 
+## Long-term project: rokid-xr (Monado HMD driver)
+
+`rokid-xr/` holds the plan (PLAN.md) for turning the Max into a real
+OpenXR HMD: IMU driver + fusion, FOV/distortion profile, SBS display.
+M0 (IMU orientation preview, `imu_preview.py`) is working.
+
 ## Escalation path (only if protocol isn't enough)
 
 Dumping the MCU firmware: needs hardware (ST-Link V2 clone or SOIC8 clip) +

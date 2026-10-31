@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>M2 FOV test</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden;}
+  #wrap{position:relative;width:100vw;height:100vh;}
+  .mark{position:absolute;color:#fff;font:bold 20px monospace;
+        transform:translate(-50%,-50%);text-align:center;line-height:1.1;}
+  .mark::before{content:"+";display:block;font-size:28px;}
+  .bar{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+       height:4px;background:#fff;width:50vw;}
+  .lbl{position:absolute;color:#0f0;font:bold 22px monospace;
+       transform:translate(-50%,-50%);}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <!-- horizontal markers every 5% from center, ±45% -->
+  <div class="bar"></div>
+  <div class="lbl" style="left:50vw;top:55vh">BAR = 50vw (compare to credit card at arm's length)</div>
+</div>
+<script>
+const wrap = document.getElementById("wrap");
+function mark(xpct, ypct, label){
+  const d = document.createElement("div");
+  d.className = "mark";
+  d.style.left = xpct + "vw";
+  d.style.top = ypct + "vh";
+  d.innerHTML = label;
+  wrap.appendChild(d);
+}
+// horizontal row (avoid center clutter: skip 45/55 which the bar covers)
+for (let x = 5; x <= 45; x += 5) { mark(x, 50, x); mark(100 - x, 50, x); }
+// vertical column
+for (let y = 5; y <= 45; y += 5) { mark(50, y, y); mark(50, 100 - y, y); }
+</script>
+</body>
+</html>
