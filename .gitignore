@@ -1,0 +1,22 @@
+# Third-party vendored clones (restore via the clone commands in
+# rokid-xr/PLAN.md / HOST_RUNBOOK.md; our changes are carried as
+# rokid-xr/rokid-max-monado.patch and the grid-floor hello_xr patch)
+rokid-xr/third_party/
+
+# Build trees
+rokid-xr/third_party/monado/build*/
+rokid-xr/third_party/openxr-sdk-source/build*/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Nix
+result
+result-*
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
