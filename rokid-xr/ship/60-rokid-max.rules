@@ -1,0 +1,5 @@
+# Rokid Max AR glasses - HID control + IMU interfaces (04d2:162f)
+# Grants the desktop user access without root. Install:
+#   sudo cp 60-rokid-max.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d2", ATTRS{idProduct}=="162f", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04d2", ATTRS{idProduct}=="162f", MODE="0660", TAG+="uaccess"

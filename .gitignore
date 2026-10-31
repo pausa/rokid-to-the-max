@@ -1,11 +1,16 @@
-# Third-party vendored clones (restore via the clone commands in
+# Third-party vendored clones (including their build trees; restore via
 # rokid-xr/PLAN.md / HOST_RUNBOOK.md; our changes are carried as
 # rokid-xr/rokid-max-monado.patch and the grid-floor hello_xr patch)
 rokid-xr/third_party/
 
-# Build trees
-rokid-xr/third_party/monado/build*/
-rokid-xr/third_party/openxr-sdk-source/build*/
+# Build outputs anywhere (CMake/ninja build dirs, appimage extraction)
+build/
+build-*/
+appimage_extracted_*/
+
+# Shipping artifacts
+*.AppImage
+rokid-bundle/
 
 # Python
 __pycache__/
