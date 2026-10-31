@@ -259,3 +259,16 @@ Bugs found and fixed in the recenter path:
 Behavior verified in hello_xr: double-tap arms at ~22 m/s^2, deferred
 recenter fires ~0.4 s later, waccel snaps to (0, +9.9, 0) and holds,
 bias untouched, cubes return to the spawn direction.
+
+## M5 addendum 11 — roll verification scene (grid-floor hello_xr)
+
+hello_xr's stock scene is a horizon-less void (roll invisible). Built a
+patched hello_xr from source (vendored at
+rokid-xr/third_party/openxr-sdk-source, build-hr/) that adds a 25x25
+grid of thin tiles 1.5 m below the head (openxr_program.cpp, Cube
+vector) — grid lines + plane edge give an unmistakable horizon.
+run-helloxr.sh auto-prefers this binary. Roll sign check: tilt ear to
+shoulder — the grid horizon must stay fixed while the VIEW of it rolls
+opposite; if the grid itself appears to rotate, roll sign is wrong.
+VERIFIED: grid horizon holds horizontal under ear-tilt; roll sign correct.
+All axes (yaw/pitch/roll) now empirically verified - driver complete.

@@ -102,4 +102,10 @@ if [ "${1:-}" = "list" ]; then
 	exec openxr_runtime_list
 fi
 
+# Prefer a locally built hello_xr (grid-floor variant) if present.
+LOCAL_HX="$HERE/third_party/openxr-sdk-source/build-hr/src/tests/hello_xr/hello_xr"
+if [ -x "$LOCAL_HX" ]; then
+    export LD_LIBRARY_PATH="$HERE/third_party/openxr-sdk-source/build-hr/src/loader${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    exec "$LOCAL_HX" -G Vulkan "$@"
+fi
 exec hello_xr -G Vulkan "$@"

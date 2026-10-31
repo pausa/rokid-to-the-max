@@ -86,9 +86,9 @@ Key Monado building blocks to use (don't reinvent):
   clock), all axes verified. DONE: recenter gesture (double-tap,
   deferred + tap-filtered, resets heading to spawn) + u_var button;
   spawn trims via ROKID_SPAWN_YAW/_PITCH env (optical-vs-IMU offset,
-  ~10 deg, cosmetic — only matters for the test scene). Roll is tracked
-  but invisible in hello_xr's horizon-less scene. Remaining for
-  upstreaming: remove 8s debug hold in pose print. Upstream-worthy
+  ~10 deg, cosmetic — only matters for the test scene). Roll verified
+  (grid-floor hello_xr build: ear-tilt keeps the horizon horizontal).
+  Remaining for upstreaming: remove 8s debug hold in pose print. Upstream-worthy
   findings: m_imu_3dof threshold swap (limit cycle) + missing gyro bias
   estimation. Upstream PR: pending.
 

@@ -32,6 +32,7 @@ pkgs.mkShell {
     xcbutilerrors
     xcbutilwm
     libxrandr
+    libxxf86vm
     opencv
     openxr-loader
   ];
