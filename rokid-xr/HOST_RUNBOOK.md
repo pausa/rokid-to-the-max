@@ -127,3 +127,26 @@ Gravity-locked, no drift while still.
 | view turns the WRONG way (right turn → world turns right) | tell me — means gyro Y flip regressed |
 | view rolls/pitches mirrored | tell me — mount rotation issue |
 | compositor Vulkan errors | run on the host GPU directly; in a VM/console session it must be a real session |
+
+## Running other OpenXR apps
+
+`run-openxr.sh <app> [args]` sets up the same environment as
+run-helloxr.sh (runtime JSON, spawn trims, Vulkan ICDs, XCB target) and
+execs any OpenXR app:
+
+    ROKID_SPAWN_PITCH=10 rokid-xr/run-openxr.sh xrgears
+
+Candidates in nixpkgs: `xrgears` (Vulkan demo), `blender` (VR scene
+inspection with a real horizon; enable in preferences), `wayvr`
+(desktop-as-virtual-screen; may expect the Monado *service* - if it
+does, run via `monado-service` + `XRT_FEATURE_SERVICE=ON` build instead).
+
+### App test results
+
+- xrgears: works (run inside monado-shell + `nix-shell -p xrgears`;
+  bare `-p` shell misses the WSI-capable Vulkan loader stack).
+- Blender VR: opens but VR session fails with repeated
+  "EGL Error (0x3000)" — Blender creates its own GL context (EGL) while
+  Monado's GL client path is GLX/X11. Try forcing X11 (unset
+  WAYLAND_DISPLAY, XDG_SESSION_TYPE=x11, EGL_PLATFORM=x11) before
+  blaming the driver.
