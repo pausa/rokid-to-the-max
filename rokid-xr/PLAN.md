@@ -81,11 +81,26 @@ Key Monado building blocks to use (don't reinvent):
   * periodic pose debug print at ROKID_LOG=DEBUG (HMD-frame euler)
   Remaining for M5: remove 8s debug hold, end-to-end OpenXR app test
   (hello_xr needs compositor + OpenXR loader), upstream patch.
-- **M5 — Polish**: recenter gesture (double-tap via Psensor event?),
-  proximity sleep integration, upstream PR.
+- **M5 — end-to-end**: hello_xr RUNS on the glasses with 3DOF tracking:
+  gravity-locked pitch/roll, stable bias, no drift (PLL-synced device
+  clock), all axes verified. DONE: recenter gesture (double-tap,
+  deferred + tap-filtered, resets heading to spawn) + u_var button;
+  spawn trims via ROKID_SPAWN_YAW/_PITCH env (optical-vs-IMU offset,
+  ~10 deg, cosmetic — only matters for the test scene). Roll is tracked
+  but invisible in hello_xr's horizon-less scene. Remaining for
+  upstreaming: remove 8s debug hold in pose print. Upstream-worthy
+  findings: m_imu_3dof threshold swap (limit cycle) + missing gyro bias
+  estimation. Upstream PR: pending.
 
 ## Layout (as it fills in)
 
 - `imu_preview.py` — M0
-- `calibration.md` — M1/M2 findings
-- `drv/` — M4+ Monado driver C sources
+- `m1_pose.py` — M1 pose sampler
+- `m2_pattern.html` — M2 FOV test pattern
+- `monado-shell.nix` — build env (incl. nix Mesa vulkan ICDs)
+- `rokid-max-monado.patch` — the driver patch (regenerate: `git diff > patch`)
+- `run-helloxr.sh` — launch hello_xr with in-process runtime (host+container path-agnostic)
+- `update-driver.sh` — revert/re-apply patch + rebuild build-host (host use)
+- `calibration.md` — M1/M2 constants + frame-convention findings
+- `HOST_RUNBOOK.md` — host setup guide
+- `drv/` — M4+ Monado driver C sources (actually: upstream `third_party/monado/src/xrt/drivers/rokid/`)

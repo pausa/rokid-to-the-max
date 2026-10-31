@@ -300,11 +300,21 @@ The CLI does a wear-check first (panels read 0x00 when not worn), writes
 both eye panels, and verifies readback. Settings do not persist across
 replug (boot default is 0xf0).
 
-## Long-term project: rokid-xr (Monado HMD driver)
+## rokid-xr (Monado HMD driver) — COMPLETE
 
-`rokid-xr/` holds the plan (PLAN.md) for turning the Max into a real
-OpenXR HMD: IMU driver + fusion, FOV/distortion profile, SBS display.
-M0 (IMU orientation preview, `imu_preview.py`) is working.
+`rokid-xr/` turns the Max into a real OpenXR HMD. **Done and verified in
+hello_xr**: 3DOF head tracking (~450 Hz, identity IMU frame map),
+gravity-locked pitch/roll, stillness-gated gyro-bias estimation,
+double-tap-on-temple recenter gesture (deferred, tap-filtered; also via
+u_var button), 49×28° FOV profile, in-process Monado runtime (no
+service/systemd), host-side build/run scripts. Includes fixes for two
+upstream Monado bugs (m_imu_3dof min/max tilt-error swap; no automatic
+bias estimation) and a driver patch (~300 lines):
+`rokid-xr/rokid-max-monado.patch` against the vendored Monado.
+
+See `rokid-xr/PLAN.md` (milestones M0–M5), `rokid-xr/calibration.md`
+(full constants + 10 addenda incl. the frame-map saga), and
+`rokid-xr/HOST_RUNBOOK.md` (build/run/recovery).
 
 ## Escalation path (only if protocol isn't enough)
 

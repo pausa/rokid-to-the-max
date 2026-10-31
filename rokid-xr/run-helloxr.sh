@@ -32,6 +32,12 @@ fi
 
 export XR_RUNTIME_JSON="$JSON"
 
+# Spawn trim (degrees): content placement vs the IMU/optical mount.
+# Set e.g. ROKID_SPAWN_YAW=-10 ROKID_SPAWN_PITCH=10 ./run-helloxr.sh
+# (driver defaults: both 0; applied at startup and on double-tap recenter)
+export ROKID_SPAWN_YAW="${ROKID_SPAWN_YAW:-0}"
+export ROKID_SPAWN_PITCH="${ROKID_SPAWN_PITCH:-0}"
+
 # Vulkan ICDs, in order of preference:
 # 1. VK_ICD_FILENAMES already set (or nix-shell shellHook set it to the
 #    nix Mesa driver stack - self-contained, like nixGL).

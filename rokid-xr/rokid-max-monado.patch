@@ -1,8 +1,38 @@
+diff --git a/src/xrt/auxiliary/math/m_imu_3dof.c b/src/xrt/auxiliary/math/m_imu_3dof.c
+index 9602fc7..a6d2e70 100644
+--- a/src/xrt/auxiliary/math/m_imu_3dof.c
++++ b/src/xrt/auxiliary/math/m_imu_3dof.c
+@@ -170,14 +170,14 @@ gravity_correction(struct m_imu_3dof *f,
+ 			struct xrt_vec3 up = {0, 1.0f, 0};
+ 			float tilt_angle = m_vec3_angle(up, accel_mean);
+ 
+-			if (tilt_angle > max_tilt_error) {
++			if (tilt_angle > min_tilt_error) {
+ 				f->grav.error_angle = tilt_angle;
+ 				f->grav.error_axis = tilt;
+ 			}
+ 		}
+ 	}
+ 
+-	if (f->grav.error_angle > min_tilt_error) {
++	if (f->grav.error_angle > max_tilt_error) {
+ 		// Correct 180° over 5 seconds, when moving.
+ 		float max_radians = (float)M_PI * (float)dt / 5;
+ 		// Correct 180° over 60 seconds, when stationary.
 diff --git a/src/xrt/drivers/rokid/rokid_hmd.c b/src/xrt/drivers/rokid/rokid_hmd.c
-index baf2d4a..060529f 100644
+index baf2d4a..204ab17 100644
 --- a/src/xrt/drivers/rokid/rokid_hmd.c
 +++ b/src/xrt/drivers/rokid/rokid_hmd.c
-@@ -61,6 +61,13 @@ struct rokid_fusion
+@@ -22,6 +22,8 @@
+ #include "math/m_imu_3dof.h"
+ #include "math/m_mathinclude.h"
+ #include "math/m_predict.h"
++#include "math/m_vec3.h"
++#include "math/m_filter_fifo.h"
+ 
+ #include "util/u_debug.h"
+ #include "util/u_device.h"
+@@ -61,6 +63,43 @@ struct rokid_fusion
  	uint64_t gyro_ts_device;
  	uint64_t accel_ts_device;
  
@@ -13,63 +43,365 @@ index baf2d4a..060529f 100644
 +	bool ts_offset_set;
 +	int64_t ts_offset;
 +
++	/* Gyro bias estimation: m_imu_3dof never auto-estimates bias (its
++	 * gyro_biasing() only fires via the debug UI), so estimate here:
++	 * stillness-gated EMA fed into i3dof.gyro_bias.value */
++	struct xrt_vec3 bias_ema;
++	bool bias_valid;
++	int bias_cooldown;
++
++	/* Double-tap recenter gesture: accel spike edge detection, two
++	 * spikes 150-600 ms apart, with the head quiet before and between
++	 * taps (glasses rebound after an impact looks like a second spike;
++	 * walking/shaking produces spikes that must not count). */
++	float tap_threshold;   // accel magnitude for a tap, m/s^2
++	uint64_t last_tap_ns;  // 0 = no recent tap
++	uint64_t last_spike_ns; // refractory after each counted spike
++	uint64_t last_motion_ns; // last time gyro showed real rotation
++	bool in_spike;
++
++	/* Double tap detected: execute the recenter later, once the tap
++	 * impulse has decayed from the accel filter and the head is quiet.
++	 * Recentering on the instantaneous accel aligns the world to the
++	 * tap impulse - a permanent tilt. */
++	bool recenter_pending;
++	uint64_t recenter_deadline_ns;
++
++	/* Spawn heading + pitch trim, applied on init and on recenter.
++	 * Pitch compensates the optical-vs-IMU mount tilt; both are
++	 * user-tunable (degrees) via env (ROKID_SPAWN_YAW / _PITCH). */
++	float spawn_yaw_deg;
++	float spawn_pitch_deg;
++
  	bool initialized;
  };
  
-@@ -160,6 +167,30 @@ rokid_convert_vector(struct rokid_usb_packed_vec *v)
+@@ -75,6 +114,8 @@ struct rokid_hmd
+ 	libusb_device_handle *usb_dev;
+ 
+ 	struct rokid_fusion fusion;
++
++	struct u_var_button recenter_btn;
+ };
+ 
+ 
+@@ -160,6 +201,15 @@ rokid_convert_vector(struct rokid_usb_packed_vec *v)
  	return result;
  }
  
 +/*
-+ * Mount rotation: the LSM6DSR in the Rokid Max reports in a
-+ * (left, down, back) frame; Monado device space is (right, up, back).
-+ * Verified by 6-pose rest calibration (see project calibration.md).
-+ * diag(-1, -1, 1) is a proper rotation (180 deg about Z), so it applies
-+ * to both accel and gyro without breaking handedness.
-+ */
-+static void
-+rokid_apply_mount_rotation(struct xrt_vec3 *v)
-+{
-+	v->x = -v->x;
-+	v->y = -v->y;
-+}
-+
-+/*
-+ * GYRO FRAME NOTE: the firmware remaps gyro axes independently of accel
-+ * (LSM6DSR ORIENT_CFG_G): it delivers gyro already in the DEVICE frame
-+ * (right, up, back) - verified empirically in hello_xr: raw gyro passes
-+ * through unchanged (identity transform gives correct yaw AND pitch;
-+ * negating x inverts pitch while yaw stays correct). Accel, in contrast,
-+ * arrives in the (left, down, back) IMU frame and needs the mount
-+ * rotation above.
++ * FRAME MAP (final, empirically settled after much pain): the firmware
++ * delivers BOTH accel and gyro already in the Monado device frame
++ * (right, up, back) - no mount rotation is needed. Earlier calibration
++ * rounds derived (left, down, back) from mis-executed rest poses; the
++ * live evidence (raw accel +9.8 on Y worn level, right turn -93 deg raw
++ * Y, look-up positive raw X) settles identity for both vectors.
 + */
 +
  // Casting helper function
  static inline struct rokid_hmd *
  rokid_hmd(struct xrt_device *xdev)
-@@ -210,6 +241,8 @@ rokid_fusion_parse_usb_packet(struct rokid_fusion *fusion, unsigned char usb_buf
+@@ -173,10 +223,100 @@ rokid_hmd(struct xrt_device *xdev)
+  *
+  */
+ 
++/*
++ * Point the fusion orientation along the current gravity vector and
++ * premultiply the spawn yaw (180 deg, puts content in front). Used by
++ * both reinit and the recenter gesture. Applying this on fusion start
++ * also removes m_imu_3dof's identity-start sweep (it assumes "device is
++ * level", which sweeps to the wearer's actual pitch at its minimum rate).
++ */
++static void
++rokid_fusion_apply_gravity_yaw(struct rokid_fusion *fusion, struct xrt_vec3 g_dev)
++{
++	float a_len = m_vec3_len(g_dev);
++	if (a_len > 4.0f) { // sane gravity reading (~9.8)
++		struct xrt_vec3 an = m_vec3_normalize(g_dev);
++		struct xrt_vec3 wup = {0.0f, 1.0f, 0.0f};
++		struct xrt_vec3 axis = {
++		    an.y * wup.z - an.z * wup.y,
++		    an.z * wup.x - an.x * wup.z,
++		    an.x * wup.y - an.y * wup.x,
++		};
++		float axis_len = m_vec3_len(axis);
++		float dot = m_vec3_dot(an, wup);
++		if (dot > 1.0f) {
++			dot = 1.0f;
++		}
++		if (dot < -1.0f) {
++			dot = -1.0f;
++		}
++		float angle = acosf(dot);
++		if (axis_len > 1e-4f) {
++			axis.x /= axis_len;
++			axis.y /= axis_len;
++			axis.z /= axis_len;
++		} else {
++			// accel already (anti)parallel to up: rotate about Z
++			axis.x = 0.0f;
++			axis.y = 0.0f;
++			axis.z = (dot > 0.0f) ? 0.0f : 1.0f;
++		}
++		math_quat_from_angle_vector(angle, &axis, &fusion->i3dof.rot);
++
++		// Yaw has no gravity reference; apply the spawn heading
++		// (user-tunable). World-frame premultiply.
++		struct xrt_quat qyaw;
++		struct xrt_vec3 yaw_axis = {0.0f, 1.0f, 0.0f};
++		math_quat_from_angle_vector(fusion->spawn_yaw_deg * ((float)M_PI / 180.0f),
++		                            &yaw_axis, &qyaw);
++		struct xrt_quat old = fusion->i3dof.rot;
++		math_quat_rotate(&qyaw, &old, &fusion->i3dof.rot);
++
++		// Pitch trim (optical axis vs IMU mount tilt): rotate about
++		// world X. Positive tilts the spawn forward vector up.
++		if (fusion->spawn_pitch_deg != 0.0f) {
++			struct xrt_quat qpitch;
++			struct xrt_vec3 pitch_axis = {1.0f, 0.0f, 0.0f};
++			math_quat_from_angle_vector(
++			    fusion->spawn_pitch_deg * ((float)M_PI / 180.0f), &pitch_axis,
++			    &qpitch);
++			struct xrt_quat old2 = fusion->i3dof.rot;
++			math_quat_rotate(&qpitch, &old2, &fusion->i3dof.rot);
++		}
++	}
++}
++
++/* Re-anchor the device->host clock mapping and initialize orientation
++ * from gravity. Called on the first packet and whenever the device clock
++ * jumps backward (replug / firmware reset): the device's timestamp
++ * counter is not monotonic across its lifetime. */
++static void
++rokid_fusion_reinit(struct rokid_fusion *fusion)
++{
++	fusion->ts_offset = os_monotonic_get_ns() - (int64_t)fusion->gyro_ts_device;
++	fusion->ts_offset_set = true;
++
++	m_imu_3dof_reset(&fusion->i3dof);
++	rokid_fusion_apply_gravity_yaw(fusion, fusion->last_accel);
++	fusion->bias_valid = false;
++	fusion->bias_cooldown = 0;
++}
++
+ static void
+ rokid_fusion_create(struct rokid_fusion *fusion)
+ {
+ 	os_mutex_init(&fusion->mutex);
++	fusion->tap_threshold = 14.0f;
++	fusion->spawn_yaw_deg = 0.0f;
++	fusion->spawn_pitch_deg = 0.0f;
++	const char *env = getenv("ROKID_SPAWN_YAW");
++	if (env != NULL && env[0] != '\0') {
++		fusion->spawn_yaw_deg = (float)atof(env);
++	}
++	env = getenv("ROKID_SPAWN_PITCH");
++	if (env != NULL && env[0] != '\0') {
++		fusion->spawn_pitch_deg = (float)atof(env);
++	}
+ 	m_imu_3dof_init(&fusion->i3dof, M_IMU_3DOF_USE_GRAVITY_DUR_300MS);
+ 	struct xrt_space_relation zero_relation = XRT_SPACE_RELATION_ZERO;
+ 	fusion->last_relation = zero_relation;
+@@ -184,8 +324,9 @@ rokid_fusion_create(struct rokid_fusion *fusion)
+ }
+ 
+ static void
+-rokid_fusion_parse_usb_packet(struct rokid_fusion *fusion, unsigned char usb_buffer[ROKID_USB_BUFFER_LEN])
++rokid_fusion_parse_usb_packet(struct rokid_hmd *rokid, unsigned char usb_buffer[ROKID_USB_BUFFER_LEN])
+ {
++	struct rokid_fusion *fusion = &rokid->fusion;
+ 	switch (usb_buffer[0]) {
+ 	case 4: {
+ 		// Old-style packet, where we get one packet for each sensor
+@@ -210,6 +351,33 @@ rokid_fusion_parse_usb_packet(struct rokid_fusion *fusion, unsigned char usb_buf
  		struct rokid_usb_pkt_combined *packet = (struct rokid_usb_pkt_combined *)usb_buffer;
  		fusion->last_gyro = rokid_convert_vector(&packet->gyro);
  		fusion->last_accel = rokid_convert_vector(&packet->accel);
-+		/* gyro is already in device frame (see note above) - no transform */
-+		rokid_apply_mount_rotation(&fusion->last_accel);
++		/* both already in device frame - see FRAME MAP note above */
++
++		// Gyro bias estimation (stillness-gated EMA, ~22s time constant at
++		// 450 Hz). Gate on the BIASED gyro length at true-stillness level;
++		// after any motion spike, a refractory period lets the decay tail
++		// pass before estimation resumes (otherwise micro-motion wander
++		// corrupts the bias and shows up as ~1 deg/s orientation drift).
++		struct xrt_vec3 biased = m_vec3_sub(fusion->last_gyro, fusion->i3dof.gyro_bias.value);
++		float biased_len = m_vec3_len(biased);
++		if (biased_len > 0.05f && fusion->bias_cooldown == 0) {
++			fusion->bias_cooldown = 450; // 1 s
++		}
++		if (fusion->bias_cooldown > 0) {
++			fusion->bias_cooldown--;
++		} else if (biased_len < 0.02f) {
++			if (!fusion->bias_valid) {
++				fusion->bias_ema = fusion->last_gyro;
++				fusion->bias_valid = true;
++			} else {
++				const float a = 0.0001f; // ~22 s time constant at 450 Hz
++				fusion->bias_ema.x += a * (fusion->last_gyro.x - fusion->bias_ema.x);
++				fusion->bias_ema.y += a * (fusion->last_gyro.y - fusion->bias_ema.y);
++				fusion->bias_ema.z += a * (fusion->last_gyro.z - fusion->bias_ema.z);
++			}
++			fusion->i3dof.gyro_bias.value = fusion->bias_ema;
++		}
++
  		fusion->gyro_ts_device = packet->timestamp;
  		fusion->accel_ts_device = packet->timestamp;
  		break;
-@@ -218,7 +251,11 @@ rokid_fusion_parse_usb_packet(struct rokid_fusion *fusion, unsigned char usb_buf
+@@ -218,8 +386,143 @@ rokid_fusion_parse_usb_packet(struct rokid_fusion *fusion, unsigned char usb_buf
  
  	// Only update fusion once we have data from both sensors for this timestamp
  	if (fusion->gyro_ts_device == fusion->accel_ts_device) {
 -		uint64_t now = os_monotonic_get_ns();
++		// Map device timestamps onto the host clock. The device clock has
++		// a few-percent skew vs the host (measured), so a one-shot offset
++		// accumulates error and makes the app's pose prediction extrapolate
++		// at constant speed forever. Instead, slew the offset toward the
++		// host clock every packet (PLL): error settles at a small constant.
++		int64_t host_now = os_monotonic_get_ns();
 +		if (!fusion->ts_offset_set) {
-+			fusion->ts_offset = os_monotonic_get_ns() - (int64_t)fusion->gyro_ts_device;
-+			fusion->ts_offset_set = true;
++			rokid_fusion_reinit(fusion);
++		} else {
++			int64_t now_raw = (int64_t)fusion->gyro_ts_device + fusion->ts_offset;
++			int64_t err = host_now - now_raw;
++			// clamp the PLL pull so one weird packet can't yank the clock
++			if (err > 100000000) { // 100 ms
++				err = 100000000;
++			} else if (err < -100000000) {
++				err = -100000000;
++			}
++			fusion->ts_offset += err / 100; // pull 1% per packet toward host clock
 +		}
 +		uint64_t now = fusion->gyro_ts_device + fusion->ts_offset;
++		if ((int64_t)now <= fusion->last_update) {
++			// device clock jumped backward (replug / firmware reset):
++			// re-anchor and start the fusion over
++			rokid_fusion_reinit(fusion);
++			now = fusion->gyro_ts_device + fusion->ts_offset;
++		}
++
++		// Double-tap-on-temple recenter gesture.
++		{
++			float a_len = m_vec3_len(fusion->last_accel);
++			struct xrt_vec3 g_biased =
++			    m_vec3_sub(fusion->last_gyro, fusion->i3dof.gyro_bias.value);
++			if (m_vec3_len(g_biased) > 0.7f) { // ~40 deg/s = real motion
++				fusion->last_motion_ns = now;
++			}
++			bool spike = a_len > fusion->tap_threshold;
++			if (spike && !fusion->in_spike) {
++				bool motion_ok = now - fusion->last_motion_ns > 250 * 1000 * 1000;
++				bool refractory_ok = now - fusion->last_spike_ns > 150 * 1000 * 1000;
++				if (motion_ok && refractory_ok) {
++					if (fusion->last_tap_ns != 0 &&
++					    now - fusion->last_tap_ns < 600 * 1000 * 1000) {
++						fusion->last_tap_ns = 0;
++						fusion->recenter_pending = true;
++						fusion->recenter_deadline_ns = now + 400 * 1000 * 1000;
++						ROKID_INFO(rokid, "Double tap: recentering...");
++					} else {
++						fusion->last_tap_ns = now;
++						ROKID_DEBUG(rokid, "tap armed (%.1f m/s^2)", a_len);
++					}
++					fusion->last_spike_ns = now;
++				} else {
++					ROKID_DEBUG(rokid, "spike %.1f m/s^2 rejected (%s%s)",
++					            a_len, motion_ok ? "" : "motion ",
++					            refractory_ok ? "" : "refractory");
++				}
++			}
++			fusion->in_spike = spike;
++		}
++
  		m_imu_3dof_update(&fusion->i3dof, now, &fusion->last_accel, &fusion->last_gyro);
++
++		// Deferred recenter: align the world to the FILTERED world-frame
++		// accel (300 ms mean - tap-free), executed once the head is quiet.
++		// Recentering on the instantaneous accel would align the world to
++		// the tap impulse - a permanent tilt.
++		if (fusion->recenter_pending && now >= fusion->recenter_deadline_ns) {
++			bool quiet = now - fusion->last_motion_ns > 250 * 1000 * 1000;
++			bool timeout = now > fusion->recenter_deadline_ns + 2 * 1000 * 1000 * 1000;
++			if (quiet || timeout) {
++				fusion->recenter_pending = false;
++				struct xrt_vec3 mean;
++				m_ff_vec3_f32_filter(fusion->i3dof.word_accel_ff,
++				                     now - 300 * 1000 * 1000, now, &mean);
++				float mlen = m_vec3_len(mean);
++				if (mlen > 4.0f) {
++					struct xrt_vec3 an = m_vec3_normalize(mean);
++					struct xrt_vec3 wup = {0.0f, 1.0f, 0.0f};
++					struct xrt_vec3 axis = {
++					    an.y * wup.z - an.z * wup.y,
++					    an.z * wup.x - an.x * wup.z,
++					    an.x * wup.y - an.y * wup.x,
++					};
++					float axis_len = m_vec3_len(axis);
++					float dot = m_vec3_dot(an, wup);
++					if (dot > 1.0f) {
++						dot = 1.0f;
++					}
++					if (dot < -1.0f) {
++						dot = -1.0f;
++					}
++					float angle = acosf(dot);
++					if (axis_len > 1e-4f) {
++						axis.x /= axis_len;
++						axis.y /= axis_len;
++						axis.z /= axis_len;
++					} else {
++						axis.x = 0.0f;
++						axis.y = 0.0f;
++						axis.z = (dot > 0.0f) ? 0.0f : 1.0f;
++						angle = (dot > 0.0f) ? 0.0f : (float)M_PI;
++					}
++					struct xrt_quat qcorr;
++					math_quat_from_angle_vector(angle, &axis, &qcorr);
++					struct xrt_quat old_rot = fusion->i3dof.rot;
++					math_quat_rotate(&qcorr, &old_rot, &fusion->i3dof.rot);
++
++					// Reset the heading to spawn_yaw too: rotate about
++					// world Y by (spawn_yaw - current yaw).
++					struct xrt_quat *rq = &fusion->i3dof.rot;
++					float cur_yaw = atan2f(2.0f * (rq->w * rq->z + rq->x * rq->y),
++					                        1.0f - 2.0f * (rq->y * rq->y + rq->z * rq->z));
++					float dyaw = fusion->spawn_yaw_deg * ((float)M_PI / 180.0f) - cur_yaw;
++					struct xrt_quat qyaw;
++					struct xrt_vec3 yaw_axis = {0.0f, 1.0f, 0.0f};
++					math_quat_from_angle_vector(dyaw, &yaw_axis, &qyaw);
++					struct xrt_quat old2 = *rq;
++					math_quat_rotate(&qyaw, &old2, rq);
++
++					// Pitch trim: match fwd pitch to spawn_pitch_deg.
++					struct xrt_vec3 fwd;
++					math_quat_rotate_vec3(rq, &(struct xrt_vec3){0.0f, 0.0f, -1.0f},
++					                      &fwd);
++					float fp = asinf(fwd.y > 1.0f ? 1.0f : (fwd.y < -1.0f ? -1.0f : fwd.y));
++					float dpitch = fusion->spawn_pitch_deg * ((float)M_PI / 180.0f) - fp;
++					struct xrt_quat qpitch;
++					struct xrt_vec3 pitch_axis = {1.0f, 0.0f, 0.0f};
++					math_quat_from_angle_vector(dpitch, &pitch_axis, &qpitch);
++					struct xrt_quat old3 = *rq;
++					math_quat_rotate(&qpitch, &old3, rq);
++
++					fusion->i3dof.grav.error_angle = 0.0f;
++					fusion->i3dof.grav.level_timestamp_ns = now;
++					ROKID_INFO(rokid, "Recentered (double tap)");
++				}
++			}
++		}
  		struct xrt_vec3 angular_velocity_ws;
  		math_quat_rotate_vec3(&fusion->i3dof.rot, &fusion->last_gyro, &angular_velocity_ws);
-@@ -288,6 +325,7 @@ rokid_usb_thread(void *ptr)
+ 		fusion->last_relation.relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+@@ -263,6 +566,8 @@ rokid_fusion_add_vars(struct rokid_fusion *fusion, void *root)
+ 	u_var_add_ro_vec3_f32(root, &fusion->last_gyro, "gyro");
+ 	u_var_add_ro_vec3_f32(root, &fusion->last_accel, "accel");
+ 	u_var_add_ro_i64(root, &fusion->last_update, "timestamp");
++	u_var_add_f32(root, &fusion->tap_threshold, "tap_threshold (m/s^2)");
++	u_var_add_f32(root, &fusion->spawn_yaw_deg, "spawn_yaw (deg, applied on recenter)");
+ }
+ 
+ 
+@@ -288,6 +593,7 @@ rokid_usb_thread(void *ptr)
  #endif
  
  	int last_libusb_result = LIBUSB_SUCCESS;
@@ -77,12 +409,14 @@ index baf2d4a..060529f 100644
  
  	os_thread_helper_lock(&rokid->usb_thread);
  	while (os_thread_helper_is_running_locked(&rokid->usb_thread) && last_libusb_result == LIBUSB_SUCCESS) {
-@@ -302,6 +340,22 @@ rokid_usb_thread(void *ptr)
+@@ -301,7 +607,37 @@ rokid_usb_thread(void *ptr)
+ 		                              sizeof(usb_buffer), &read_length, ROKID_USB_TRANSFER_TIMEOUT_MS);
  		if (last_libusb_result == LIBUSB_SUCCESS) {
  			os_mutex_lock(&rokid->fusion.mutex);
- 			rokid_fusion_parse_usb_packet(&rokid->fusion, usb_buffer);
-+			// Periodic orientation debug output (~2 Hz): sanity check of
-+			// mount rotation + fusion. Euler, degrees.
+-			rokid_fusion_parse_usb_packet(&rokid->fusion, usb_buffer);
++			rokid_fusion_parse_usb_packet(rokid, usb_buffer);
++			// Periodic orientation debug output (~10 Hz): sanity check of
++			// mount rotation + fusion + bias estimation.
 +			if (rokid->log_level >= U_LOGGING_DEBUG && (++packet_count % 45) == 0) {
 +				struct xrt_quat *q = &rokid->fusion.last_relation.pose.orientation;
 +				float ys = 2.0f * (q->w * q->z + q->x * q->y);
@@ -90,17 +424,50 @@ index baf2d4a..060529f 100644
 +				float ps = 2.0f * (q->w * q->y - q->z * q->x);
 +				float rs = 2.0f * (q->w * q->x + q->y * q->z);
 +				float rc = 1.0f - 2.0f * (q->x * q->x + q->y * q->y);
-+				// HMD-frame euler: yaw about +Y (up), pitch about +X (right),
-+				// roll about +Z (back). Turning right should give NEGATIVE yaw.
-+				ROKID_DEBUG(rokid, "pose: yaw %+6.1f pitch %+6.1f roll %+6.1f deg",
-+				            (float)(180.0 / M_PI) * asinf(ps),
-+				            (float)(180.0 / M_PI) * atan2f(rs, rc),
-+				            (float)(180.0 / M_PI) * atan2f(ys, yc));
++				// Device forward and up vectors in world frame - more
++				// readable than euler near gimbal points (a 180 deg spawn
++				// yaw shows as roll ~180 in ZYX euler).
++				struct xrt_vec3 fwd, upw, waccel;
++				struct xrt_vec3 f_dev = {0.0f, 0.0f, -1.0f};
++				struct xrt_vec3 u_dev = {0.0f, 1.0f, 0.0f};
++				math_quat_rotate_vec3(q, &f_dev, &fwd);
++				math_quat_rotate_vec3(q, &u_dev, &upw);
++				math_quat_rotate_vec3(q, &rokid->fusion.last_accel, &waccel);
++				ROKID_DEBUG(rokid, "pose: fwd (%+.2f,%+.2f,%+.2f) up (%+.2f,%+.2f,%+.2f) waccel (%+.1f,%+.1f,%+.1f) raw (%+.1f,%+.1f,%+.1f) bias (%+.4f,%+.4f,%+.4f)",
++				            fwd.x, fwd.y, fwd.z,
++				            upw.x, upw.y, upw.z,
++				            waccel.x, waccel.y, waccel.z,
++				            rokid->fusion.last_accel.x,
++				            rokid->fusion.last_accel.y,
++				            rokid->fusion.last_accel.z,
++				            rokid->fusion.i3dof.gyro_bias.value.x,
++				            rokid->fusion.i3dof.gyro_bias.value.y,
++				            rokid->fusion.i3dof.gyro_bias.value.z,
++				            m_vec3_len(rokid->fusion.last_gyro));
 +			}
  			os_mutex_unlock(&rokid->fusion.mutex);
  		}
  
-@@ -421,9 +475,26 @@ rokid_hmd_destroy(struct xrt_device *xdev)
+@@ -414,6 +750,18 @@ rokid_hmd_usb_init(struct rokid_hmd *rokid, struct xrt_prober_device *prober_dev
+  *
+  */
+ 
++static void
++rokid_recenter_btn_cb(void *ptr)
++{
++	struct rokid_hmd *rokid = rokid_hmd(ptr);
++	os_mutex_lock(&rokid->fusion.mutex);
++	// Use the deferred path: aligns to the filtered world accel once
++	// quiet, instead of the instantaneous (possibly moving) accel.
++	rokid->fusion.recenter_pending = true;
++	rokid->fusion.recenter_deadline_ns = os_monotonic_get_ns();
++	os_mutex_unlock(&rokid->fusion.mutex);
++}
++
+ static void
+ rokid_hmd_destroy(struct xrt_device *xdev)
+ {
+@@ -421,9 +769,26 @@ rokid_hmd_destroy(struct xrt_device *xdev)
  	// as it can be called from the middle of the constructor.
  
  	struct rokid_hmd *rokid = rokid_hmd(xdev);
@@ -127,7 +494,7 @@ index baf2d4a..060529f 100644
  
  	if (rokid->fusion.initialized) {
  		rokid_fusion_destroy(&rokid->fusion);
-@@ -478,7 +549,6 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
+@@ -478,7 +843,6 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
  	}
  	bool is_rokid_max = strstr(rokid->base.str, "Max");
  	ROKID_INFO(rokid, "Rokid model: %s", (is_rokid_max ? "Max" : "Air"));
@@ -135,7 +502,7 @@ index baf2d4a..060529f 100644
  	// This list should be ordered, most preferred first.
  	size_t idx = 0;
  	rokid->base.hmd->blend_modes[idx++] = XRT_BLEND_MODE_OPAQUE;
-@@ -496,12 +566,15 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
+@@ -496,12 +860,15 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
  	rokid->base.supported.orientation_tracking = true;
  	rokid->base.supported.position_tracking = false;
  
@@ -154,7 +521,17 @@ index baf2d4a..060529f 100644
  	const float display_tilt = (is_rokid_max ? 0.035f : 0.011f);
  	struct xrt_fov fov = {
  	    .angle_left = -quarter_hFOV,
-@@ -549,7 +622,11 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
+@@ -537,6 +904,9 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
+ 	// Setup variable tracker: Optional but useful for debugging
+ 	u_var_add_root(rokid, "Rokid", true);
+ 	u_var_add_log_level(rokid, &rokid->log_level, "log_level");
++	rokid->recenter_btn.cb = rokid_recenter_btn_cb;
++	rokid->recenter_btn.ptr = rokid;
++	u_var_add_button(rokid, &rokid->recenter_btn, "Recenter");
+ 	rokid_fusion_add_vars(&rokid->fusion, rokid);
+ 
+ 	if (os_thread_helper_start(&rokid->usb_thread, rokid_usb_thread, rokid) != 0) {
+@@ -549,7 +919,11 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
  		ROKID_ERROR(rokid, "Failed to get display mode");
  		goto cleanup;
  	}
