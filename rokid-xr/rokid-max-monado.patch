@@ -1,0 +1,169 @@
+diff --git a/src/xrt/drivers/rokid/rokid_hmd.c b/src/xrt/drivers/rokid/rokid_hmd.c
+index baf2d4a..060529f 100644
+--- a/src/xrt/drivers/rokid/rokid_hmd.c
++++ b/src/xrt/drivers/rokid/rokid_hmd.c
+@@ -61,6 +61,13 @@ struct rokid_fusion
+ 	uint64_t gyro_ts_device;
+ 	uint64_t accel_ts_device;
+ 
++	/* device-ts -> host-ts mapping, established on first packet: the
++	 * device clock is a stable 450Hz counter, immune to USB arrival
++	 * jitter that otherwise degrades fusion dt and slows bias
++	 * convergence */
++	bool ts_offset_set;
++	int64_t ts_offset;
++
+ 	bool initialized;
+ };
+ 
+@@ -160,6 +167,30 @@ rokid_convert_vector(struct rokid_usb_packed_vec *v)
+ 	return result;
+ }
+ 
++/*
++ * Mount rotation: the LSM6DSR in the Rokid Max reports in a
++ * (left, down, back) frame; Monado device space is (right, up, back).
++ * Verified by 6-pose rest calibration (see project calibration.md).
++ * diag(-1, -1, 1) is a proper rotation (180 deg about Z), so it applies
++ * to both accel and gyro without breaking handedness.
++ */
++static void
++rokid_apply_mount_rotation(struct xrt_vec3 *v)
++{
++	v->x = -v->x;
++	v->y = -v->y;
++}
++
++/*
++ * GYRO FRAME NOTE: the firmware remaps gyro axes independently of accel
++ * (LSM6DSR ORIENT_CFG_G): it delivers gyro already in the DEVICE frame
++ * (right, up, back) - verified empirically in hello_xr: raw gyro passes
++ * through unchanged (identity transform gives correct yaw AND pitch;
++ * negating x inverts pitch while yaw stays correct). Accel, in contrast,
++ * arrives in the (left, down, back) IMU frame and needs the mount
++ * rotation above.
++ */
++
+ // Casting helper function
+ static inline struct rokid_hmd *
+ rokid_hmd(struct xrt_device *xdev)
+@@ -210,6 +241,8 @@ rokid_fusion_parse_usb_packet(struct rokid_fusion *fusion, unsigned char usb_buf
+ 		struct rokid_usb_pkt_combined *packet = (struct rokid_usb_pkt_combined *)usb_buffer;
+ 		fusion->last_gyro = rokid_convert_vector(&packet->gyro);
+ 		fusion->last_accel = rokid_convert_vector(&packet->accel);
++		/* gyro is already in device frame (see note above) - no transform */
++		rokid_apply_mount_rotation(&fusion->last_accel);
+ 		fusion->gyro_ts_device = packet->timestamp;
+ 		fusion->accel_ts_device = packet->timestamp;
+ 		break;
+@@ -218,7 +251,11 @@ rokid_fusion_parse_usb_packet(struct rokid_fusion *fusion, unsigned char usb_buf
+ 
+ 	// Only update fusion once we have data from both sensors for this timestamp
+ 	if (fusion->gyro_ts_device == fusion->accel_ts_device) {
+-		uint64_t now = os_monotonic_get_ns();
++		if (!fusion->ts_offset_set) {
++			fusion->ts_offset = os_monotonic_get_ns() - (int64_t)fusion->gyro_ts_device;
++			fusion->ts_offset_set = true;
++		}
++		uint64_t now = fusion->gyro_ts_device + fusion->ts_offset;
+ 		m_imu_3dof_update(&fusion->i3dof, now, &fusion->last_accel, &fusion->last_gyro);
+ 		struct xrt_vec3 angular_velocity_ws;
+ 		math_quat_rotate_vec3(&fusion->i3dof.rot, &fusion->last_gyro, &angular_velocity_ws);
+@@ -288,6 +325,7 @@ rokid_usb_thread(void *ptr)
+ #endif
+ 
+ 	int last_libusb_result = LIBUSB_SUCCESS;
++	uint64_t packet_count = 0;
+ 
+ 	os_thread_helper_lock(&rokid->usb_thread);
+ 	while (os_thread_helper_is_running_locked(&rokid->usb_thread) && last_libusb_result == LIBUSB_SUCCESS) {
+@@ -302,6 +340,22 @@ rokid_usb_thread(void *ptr)
+ 		if (last_libusb_result == LIBUSB_SUCCESS) {
+ 			os_mutex_lock(&rokid->fusion.mutex);
+ 			rokid_fusion_parse_usb_packet(&rokid->fusion, usb_buffer);
++			// Periodic orientation debug output (~2 Hz): sanity check of
++			// mount rotation + fusion. Euler, degrees.
++			if (rokid->log_level >= U_LOGGING_DEBUG && (++packet_count % 45) == 0) {
++				struct xrt_quat *q = &rokid->fusion.last_relation.pose.orientation;
++				float ys = 2.0f * (q->w * q->z + q->x * q->y);
++				float yc = 1.0f - 2.0f * (q->y * q->y + q->z * q->z);
++				float ps = 2.0f * (q->w * q->y - q->z * q->x);
++				float rs = 2.0f * (q->w * q->x + q->y * q->z);
++				float rc = 1.0f - 2.0f * (q->x * q->x + q->y * q->y);
++				// HMD-frame euler: yaw about +Y (up), pitch about +X (right),
++				// roll about +Z (back). Turning right should give NEGATIVE yaw.
++				ROKID_DEBUG(rokid, "pose: yaw %+6.1f pitch %+6.1f roll %+6.1f deg",
++				            (float)(180.0 / M_PI) * asinf(ps),
++				            (float)(180.0 / M_PI) * atan2f(rs, rc),
++				            (float)(180.0 / M_PI) * atan2f(ys, yc));
++			}
+ 			os_mutex_unlock(&rokid->fusion.mutex);
+ 		}
+ 
+@@ -421,9 +475,26 @@ rokid_hmd_destroy(struct xrt_device *xdev)
+ 	// as it can be called from the middle of the constructor.
+ 
+ 	struct rokid_hmd *rokid = rokid_hmd(xdev);
++	// Debug builds: hold the device open briefly so short-lived test
++	// harnesses (monado-cli test) still exercise the IMU thread.
++	if (rokid->log_level >= U_LOGGING_DEBUG) {
++		os_nanosleep((int64_t)8 * U_TIME_1S_IN_NS);
++	}
+ 	if (rokid->usb_thread.initialized) {
+ 		os_thread_helper_destroy(&rokid->usb_thread);
+ 	}
++	// Release the interface and let the kernel driver (usbhid) back on,
++	// otherwise /dev/hidraw* disappears until replug.
++	if (rokid->usb_dev != NULL) {
++		libusb_release_interface(rokid->usb_dev, ROKID_USB_INTERFACE_NUM);
++		libusb_attach_kernel_driver(rokid->usb_dev, ROKID_USB_INTERFACE_NUM);
++		libusb_close(rokid->usb_dev);
++		rokid->usb_dev = NULL;
++	}
++	if (rokid->usb_ctx != NULL) {
++		libusb_exit(rokid->usb_ctx);
++		rokid->usb_ctx = NULL;
++	}
+ 
+ 	if (rokid->fusion.initialized) {
+ 		rokid_fusion_destroy(&rokid->fusion);
+@@ -478,7 +549,6 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
+ 	}
+ 	bool is_rokid_max = strstr(rokid->base.str, "Max");
+ 	ROKID_INFO(rokid, "Rokid model: %s", (is_rokid_max ? "Max" : "Air"));
+-
+ 	// This list should be ordered, most preferred first.
+ 	size_t idx = 0;
+ 	rokid->base.hmd->blend_modes[idx++] = XRT_BLEND_MODE_OPAQUE;
+@@ -496,12 +566,15 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
+ 	rokid->base.supported.orientation_tracking = true;
+ 	rokid->base.supported.position_tracking = false;
+ 
+-	// Set up display details
++	// Set up display details.
++	// FOV values are from empirical measurement (marker-grid + angular
++	// reference): per-eye hFOV ~49 deg, vFOV ~28 deg, full 960x1080 per
++	// eye usable (no vignetting). See project calibration.md.
+ 	// refresh rate
+ 	rokid->base.hmd->screens[0].nominal_frame_interval_ns = time_s_to_ns(1.0f / 60.0f);
+ 
+-	const float quarter_vFOV = 0.25f * (is_rokid_max ? 46.0f : 40.0f) * ((float)M_PI / 180.0f);
+-	const float quarter_hFOV = quarter_vFOV * 16.0f / 9.0f;
++	const float quarter_vFOV = 14.0f * ((float)M_PI / 180.0f);
++	const float quarter_hFOV = 24.5f * ((float)M_PI / 180.0f);
+ 	const float display_tilt = (is_rokid_max ? 0.035f : 0.011f);
+ 	struct xrt_fov fov = {
+ 	    .angle_left = -quarter_hFOV,
+@@ -549,7 +622,11 @@ rokid_hmd_create(struct xrt_prober_device *prober_device)
+ 		ROKID_ERROR(rokid, "Failed to get display mode");
+ 		goto cleanup;
+ 	}
+-	if (display_mode != 1) {
++	// The Max does not implement the (HDK-era) display-mode vendor
++	// command: reads return zeros and writes are silently ignored. Its
++	// SBS mode is driven purely by the DP stream contents, so skip the
++	// mode switch entirely on Max hardware.
++	if (display_mode != 1 && !is_rokid_max) {
+ 		ROKID_INFO(rokid, "Setting Rokid display to SBS mode");
+ 		if (!rokid_hmd_set_display_mode(rokid, 1)) {
+ 			ROKID_ERROR(rokid, "Failed to get display mode");

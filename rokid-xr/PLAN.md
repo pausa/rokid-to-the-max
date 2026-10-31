@@ -59,11 +59,28 @@ Key Monado building blocks to use (don't reinvent):
 - **M2 — FOV measurement**: DONE — marker-grid + credit-card method:
   no vignetting (full panel usable), hFOV ≈ 49°, vFOV ≈ 28°,
   ~39 px/deg. See `calibration.md`.
-- **M3 — Monado dev environment**: build Monado from source, run with
-  dummy/null HMD, understand `xrt_device` lifecycle.
-- **M4 — Driver skeleton**: `drv/rokid_max.c` — register device via
-  xrt_prober (vid/pid 04d2:162f, interface 2), read 0x11 reports, feed
-  m_imu_fusion, expose HMD with M2 numbers, SBS display.
+- **M3 — Monado dev environment**: DONE — `monado-shell.nix` (cmake,
+  ninja, vulkan headers, glslang, libdrm, hidapi...); full build OK
+  (~590 targets); `monado-cli` runs; prober sees the Max via libusb
+  (04d2:162f, /dev/ttyACM0 listed as serial path).
+  **Key discovery:** upstream already ships `src/xrt/drivers/rokid/` —
+  but it is for the old Rokid **HDK** devkit and claims our Max by
+  VID/PID collision. It reads endpoint 0x82 (iface 2 = our IMU) with the
+  wrong packet format and issues vendor control transfers (GET 0x81 /
+  SET 0x01). All reads return zeros on the Max and the SBS-mode write is
+  silently ignored (consistent with our earlier control-transfer probe).
+- **M4 — Driver**: DONE (first working state) — `drv_rokid` reworked:
+  * mount rotation (accel: (-x,-y,z), gyro: (-x,+y,z) - firmware remaps
+    gyro Y independently via LSM6DSR ORIENT_CFG_G; verified empirically:
+    right turn = negative yaw, gravity lock on pitch/roll)
+  * FOV per calibration.md: 49x28 deg (was 46v/82h HDK guesswork)
+  * display-mode vendor writes skipped on Max (HDK-era command, ignored
+    by Max MCU)
+  * USB cleanup on destroy (release + kernel reattach - no more stale
+    hidraw after driver exit)
+  * periodic pose debug print at ROKID_LOG=DEBUG (HMD-frame euler)
+  Remaining for M5: remove 8s debug hold, end-to-end OpenXR app test
+  (hello_xr needs compositor + OpenXR loader), upstream patch.
 - **M5 — Polish**: recenter gesture (double-tap via Psensor event?),
   proximity sleep integration, upstream PR.
 
