@@ -26,7 +26,9 @@ pkgs.mkShell {
     hidapi
     dbus
     wayland
+    wayland-scanner
     wayland-protocols
+    libffi
     libx11
     libxcb
     xcbutilerrors

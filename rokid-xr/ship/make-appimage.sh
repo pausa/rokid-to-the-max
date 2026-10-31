@@ -78,6 +78,22 @@ echo "==> 3/6 copying our artifacts"
 cp "$RUNTIME_LIB" "$HX" "$HXLOADER" "$APPDIR/usr/lib/"
 cp "$MONADO/src/xrt/targets/cli/monado-cli" "$APPDIR/usr/bin/" || true
 
+# rokid-screen (desktop viewer) - drop its build-time rpath, the bundled
+# ld invocation resolves libopenxr_loader.so from usr/lib
+RS="$HERE/rokid-screen/build/rokid-screen"
+if [ -x "$RS" ]; then
+  cp "$RS" "$APPDIR/usr/lib/"
+  nix-shell -p patchelf --run "patchelf --remove-rpath '$APPDIR/usr/lib/rokid-screen'"
+  # copy any deps the closure missed (e.g. libwayland-client came in via
+  # monado, but be safe)
+  for dep in $(ldd "$RS" | awk '/=> \/nix\// {print $3}'); do
+    base=$(basename "$dep")
+    [ -e "$APPDIR/usr/lib/$base" ] || cp -L "$dep" "$APPDIR/usr/lib/"
+  done
+else
+  echo "WARNING: rokid-screen not built - skipping (cmake -S rokid-screen -B rokid-screen/build)"
+fi
+
 echo "==> 4/6 patchelf rpath \$ORIGIN"
 nix-shell -p patchelf --run '
   cd "'"$APPDIR"'/usr/lib"
@@ -176,6 +192,12 @@ case "${1:-}" in
   ""|hello|helloxr)
     exec "$LD" --library-path "$APPDIR/usr/lib" "$APPDIR/usr/lib/hello_xr" -G Vulkan "${@:2}"
     ;;
+  screen)
+    exec "$LD" --library-path "$APPDIR/usr/lib" "$APPDIR/usr/lib/rokid-screen" "${@:2}"
+    ;;
+  --gdb-screen)
+    exec gdb -q --args "$LD" --library-path "$APPDIR/usr/lib" "$APPDIR/usr/lib/rokid-screen" "${@:2}"
+    ;;
   list)
     exec "$LD" --library-path "$APPDIR/usr/lib" "$APPDIR/usr/lib/hello_xr" --help
     ;;
@@ -219,6 +241,10 @@ One-time setup (needs sudo, once per machine):
 Run:
   ./rokid-max-hmd.AppImage                 # hello_xr with grid floor
   ./rokid-max-hmd.AppImage <openxr-app>    # e.g. xrgears
+
+Desktop screen in the glasses (wlr-screencopy, Hyprland/Sway/...):
+  ./rokid-max-hmd.AppImage screen
+  env: ROKID_SCREEN_FPS (30), ROKID_SCREEN_SCALE (1.0), ROKID_SCREEN_TEST=1
 
 Use with host OpenXR apps (blender, steam, ...):
   eval "$(./rokid-max-hmd.AppImage --runtime-env)"

@@ -48,3 +48,12 @@ Steam: game launch options
 glibc note: the runtime lib is built against glibc 2.42 - the HOST app
 process must provide it (Manjaro-current OK; SteamOS 3.x is older, so
 host apps there need a compat build against an older nixpkgs - TODO).
+
+## rokid-screen (`./rokid-max-hmd.AppImage screen`)
+
+Desktop viewer subproject (rokid-xr/rokid-screen): wlr-screencopy
+capture -> vkCmdCopyBufferToImage into both eye swapchains (transfer
+only, no shaders, no mirror window). Anchored to LOCAL space - the
+double-tap recenter moves it. Container-validated up to swapchain
+creation + session begin; needs real GPU/host X for the compositor.
+Env: ROKID_SCREEN_FPS, ROKID_SCREEN_SCALE, ROKID_SCREEN_TEST.
