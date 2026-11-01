@@ -15,8 +15,20 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)   # rokid-xr/
 OUT=${1:-"$HERE/../rokid-max-hmd.AppImage"}
-WORK=$(mktemp -d /tmp/rokid-appimg.XXXXXX)
+# persistent AppDir: steps 1/2/4 (closure+flatten+patchelf) only run when
+# the cache is empty or FORCE=1; artifacts are always refreshed, so FAST
+# rebuilds (~20s) pick up recompiled binaries.
+WORK=${WORK:-/tmp/rokid-appimg-cache}
 APPDIR="$WORK/rokid-max-hmd.AppDir"
+chmod -R u+w "$WORK.new" 2>/dev/null || true
+rm -rf "$WORK.new"; mkdir -p "$WORK" "$WORK.new"
+FULL=1
+if [ -d "$APPDIR/usr/lib" ] && [ "${FORCE:-0}" != 1 ]; then
+  FULL=0
+  mv "$APPDIR" "$WORK.new/rokid-max-hmd.AppDir"
+fi
+APPDIR="$WORK.new/rokid-max-hmd.AppDir"
+if [ "$FULL" = 0 ]; then echo "==> reusing cached AppDir (FORCE=1 for full rebuild)"; fi
 
 echo "==> workdir $WORK"
 mkdir -p "$APPDIR/usr/lib" "$APPDIR/usr/bin" \
@@ -28,6 +40,7 @@ RUNTIME_LIB="$MONADO/src/xrt/targets/openxr/libopenxr_monado.so"
 HX="$HXSRCDIR/src/tests/hello_xr/hello_xr"
 HXLOADER="$HXSRCDIR/src/loader/libopenxr_loader.so.1"
 
+if [ "$FULL" = 1 ]; then
 echo "==> 1/6 collecting runtime closure"
 SEED_LIBS=(
   "$RUNTIME_LIB" "$HX" "$HXLOADER"
@@ -74,6 +87,8 @@ while read -r p; do
   [ -d "$p/lib/pulseaudio" ] && cp -aL "$p"/lib/pulseaudio/*.so* "$APPDIR/usr/lib/" 2>/dev/null || true
 done < /tmp/appimg-closure.txt
 
+fi  # FULL: closure + flatten
+
 echo "==> 3/6 copying our artifacts"
 cp "$RUNTIME_LIB" "$HX" "$HXLOADER" "$APPDIR/usr/lib/"
 cp "$MONADO/src/xrt/targets/cli/monado-cli" "$APPDIR/usr/bin/" || true
@@ -83,7 +98,8 @@ cp "$MONADO/src/xrt/targets/cli/monado-cli" "$APPDIR/usr/bin/" || true
 RS="$HERE/rokid-screen/build/rokid-screen"
 if [ -x "$RS" ]; then
   cp "$RS" "$APPDIR/usr/lib/"
-  nix-shell -p patchelf --run "patchelf --remove-rpath '$APPDIR/usr/lib/rokid-screen'"
+  [ -x /tmp/rokid-patchelf ] || nix-shell -p patchelf --run 'cp "$(command -v patchelf)" /tmp/rokid-patchelf'
+/tmp/rokid-patchelf --remove-rpath "$APPDIR/usr/lib/rokid-screen"
   # copy any deps the closure missed (e.g. libwayland-client came in via
   # monado, but be safe)
   for dep in $(ldd "$RS" | awk '/=> \/nix\// {print $3}'); do
@@ -94,6 +110,17 @@ else
   echo "WARNING: rokid-screen not built - skipping (cmake -S rokid-screen -B rokid-screen/build)"
 fi
 
+# pipewire SPA plugins - dlopened at runtime, invisible to ldd
+SPA_DIR=$(nix-shell "$HERE/monado-shell.nix" --run 'echo "$(pkg-config --variable=libdir libpipewire-0.3)/spa-0.2"' 2>/dev/null | tail -1)
+if [ -d "$SPA_DIR" ]; then
+  mkdir -p "$APPDIR/usr/lib/spa-0.2"
+  cp -aL "$SPA_DIR"/. "$APPDIR/usr/lib/spa-0.2/"
+  chmod -R u+w "$APPDIR/usr/lib/spa-0.2"  # nix store perms block later rm
+else
+  echo "WARNING: spa-0.2 plugins not found - pipewire capture will fail"
+fi
+
+if [ "$FULL" = 1 ]; then
 echo "==> 4/6 patchelf rpath \$ORIGIN"
 nix-shell -p patchelf --run '
   cd "'"$APPDIR"'/usr/lib"
@@ -102,6 +129,7 @@ nix-shell -p patchelf --run '
   done
   patchelf --set-rpath "\$ORIGIN" ../bin/* 2>/dev/null || true
 '
+fi
 
 echo "==> 5/6 ICD JSONs (bare sonames) + OpenXR runtime JSON template"
 for j in radeon_icd.x86_64.json intel_icd.x86_64.json lvp_icd.x86_64.json; do
@@ -153,6 +181,7 @@ export VK_ICD_FILENAMES="$APPDIR/usr/share/vulkan/icd.d/radeon_icd.x86_64.json:$
 # Force the X11(XCB) compositor target (no wayland target compiled in;
 # XWayland serves X11 under Wayland sessions).
 export XRT_COMPOSITOR_FORCE_XCB=1
+export SPA_PLUGIN_DIR="$APPDIR/usr/lib/spa-0.2"
 
 case "${1:-}" in
   --install-runtime)
@@ -194,6 +223,9 @@ case "${1:-}" in
     ;;
   screen)
     exec "$LD" --library-path "$APPDIR/usr/lib" "$APPDIR/usr/lib/rokid-screen" "${@:2}"
+    ;;
+  --portal-test|--portal*)
+    exec "$LD" --library-path "$APPDIR/usr/lib" "$APPDIR/usr/lib/rokid-screen" "$1" "${@:2}"
     ;;
   --gdb-screen)
     exec gdb -q --args "$LD" --library-path "$APPDIR/usr/lib" "$APPDIR/usr/lib/rokid-screen" "${@:2}"
@@ -268,10 +300,15 @@ EOF
 
 echo "==> building AppImage"
 cd "$WORK"
-curl -fsSL -o appimagetool.AppImage \
-  "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
-chmod +x appimagetool.AppImage
-./appimagetool.AppImage --appimage-extract > /dev/null
-./squashfs-root/AppRun --no-appstream "$APPDIR" "$OUT"
+if [ ! -x "$WORK/squashfs-root/AppRun" ]; then
+  curl -fsSL -o appimagetool.AppImage \
+    "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+  chmod +x appimagetool.AppImage
+  ./appimagetool.AppImage --appimage-extract > /dev/null
+fi
+"$WORK/squashfs-root/AppRun" --no-appstream "$APPDIR" "$OUT"
+# promote the freshly built AppDir to be the cache for next time
+chmod -R u+w "$WORK.new" 2>/dev/null || true
+rm -rf "$WORK"; mv "$WORK.new" "$WORK"
 du -sh "$OUT"
 echo "AppImage ready: $OUT"

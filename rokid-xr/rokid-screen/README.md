@@ -62,6 +62,18 @@ nix-shell rokid-xr/monado-shell.nix --run 'rokid-xr/rokid-screen/run-rokid-scree
   array-of-pointers (SIGSEGV in oxr_session_frame_end), wlr-screencopy
   `buffer` event arg order (format FIRST: format,w,h,stride), output
   enumeration with stable listener addresses, shader embedding.
+- **WORKING (checkpoint)**: niri wlr-screencopy capture -> glasses.
+  Root causes found by reading niri/smithay sources: (1) niri needs a
+  grim-style exact pool (stride*w bytes, buffer at offset 0, XRGB8888);
+  (2) R/B swap needed with the .bgr shader (default on,
+  ROKID_SCREEN_SWAP_RB=0 to restore); (3) sRGB swapchain format 43
+  default - UNORM gets gamma-reencoded by Monado comp (washed out).
+- PipeWire portal path also works end-to-end (frames reach glasses) but
+  niri's xdg-desktop-portal-gnome serves the CAMERA node (YUY2 400x480,
+  source_type mislabeled) - kept as ROKID_SCREEN_SOURCE=portal fallback
+  for GNOME; YUY2 conversion included. Portal lessons: session_handle
+  is a positional arg; session_handle_token REQUIRED (older xdg-p
+  asserts without it); subscribe Response BEFORE calling.
 - **Still open**: real wlr-screencopy capture rejected by Hyprland with
   `invalid buffer` even with correct event parsing, correct format from
   the buffer event, and roundtrip/flush before copy. grim works, so the

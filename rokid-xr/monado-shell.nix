@@ -25,6 +25,7 @@ pkgs.mkShell {
     udev
     hidapi
     dbus
+    pipewire
     wayland
     wayland-scanner
     wayland-protocols

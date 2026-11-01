@@ -23,18 +23,28 @@ add_custom_command(
 set(OPENXR_SDK ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/openxr-sdk-source)
 set(LOADER_LIB ${OPENXR_SDK}/build-hr/src/loader/libopenxr_loader.so)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DBUS REQUIRED dbus-1)
+pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)
+
 add_executable(rokid-screen
   src/main.cpp
+  src/portal.cpp
+  src/pwcap.cpp
   ${PROTO_CODE})
 
 target_include_directories(rokid-screen PRIVATE
   ${CMAKE_CURRENT_BINARY_DIR}
+  ${DBUS_INCLUDE_DIRS}
+  ${PIPEWIRE_INCLUDE_DIRS}
   ${OPENXR_SDK}/include
   ${WAYLAND_INCLUDE_DIRS})
 
 target_link_libraries(rokid-screen PRIVATE
   Vulkan::Vulkan
   ${WAYLAND_LIBRARIES}
+  ${DBUS_LIBRARIES}
+  ${PIPEWIRE_LIBRARIES}
   ${LOADER_LIB}
   pthread)
 

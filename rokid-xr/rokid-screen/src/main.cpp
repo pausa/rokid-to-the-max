@@ -18,6 +18,9 @@
 #define XR_USE_GRAPHICS_API_VULKAN 1
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
+#include "portal.hpp"
+#include "pwcap.hpp"
+#include <spa/param/video/raw-utils.h>
 #include <openxr/openxr_platform.h>
 #include <wayland-client.h>
 #include "screencopy-client-protocol.h"
@@ -101,7 +104,7 @@ now_s()
 	return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
 }
 
-static std::atomic<bool> running{true};
+std::atomic<bool> running{true}; // extern-shared with pwcap.cpp
 static void
 on_sigint(int)
 {
@@ -205,14 +208,103 @@ void
 	void
 	run()
 	{
-		if (!env_flag("ROKID_SCREEN_TEST", false)) {
+		if (env_flag("ROKID_SCREEN_TEST", false)) {
+			run_test_pattern();
+			return;
+		}
+		const char *src = getenv("ROKID_SCREEN_SOURCE"); // wayland|portal
+		bool want_wayland = src ? strcmp(src, "wayland") == 0 : true;
+		if (want_wayland) {
 			if (try_wayland()) {
 				return;
 			}
-			P("Wayland capture unavailable, using test pattern (ROKID_SCREEN_TEST=1 forces this)\n");
+			P("Wayland capture unavailable\n");
+			if (src) { // explicitly requested -> no fallback
+				run_test_pattern();
+				return;
+			}
 		}
+		// fallback: xdg-desktop-portal ScreenCast -> PipeWire (GNOME et al)
+		long node = -1;
+		if (const char *n = getenv("ROKID_SCREEN_NODE"))
+			node = atol(n); // reuse a previous node id, skips the consent dialog
+		if (node < 0) {
+			node = portal::screencast_node(g_trace);
+		}
+		if (node >= 0) {
+			pwcap::start_stream((uint32_t)node, g_trace, on_pw_frame, this);
+			pwcap::stop_stream(); // returns when `running` goes false
+			return;
+		}
+		P("portal capture unavailable, using test pattern\n");
 		run_test_pattern();
 	}
+
+	// ---- pipewire frame -> publish ----------------------------------------
+	static void
+	on_pw_frame(void *ud, const uint8_t *data, uint32_t w, uint32_t h, uint32_t stride, uint32_t fmt)
+	{
+		auto *c = (Capture *)ud;
+		switch (fmt) {
+		case SPA_VIDEO_FORMAT_BGRx:
+		case SPA_VIDEO_FORMAT_BGRA:
+			c->publish(data, w, h, stride, false); // B,G,R,x - memcpy path
+			break;
+		case SPA_VIDEO_FORMAT_RGBx:
+		case SPA_VIDEO_FORMAT_RGBA:
+			c->publish(data, w, h, stride, true);
+			break;
+		case SPA_VIDEO_FORMAT_RGB16: {
+			c->pw_scratch.resize((size_t)w * h * 4);
+			for (uint32_t y = 0; y < h; y++) {
+				const uint8_t *sr = data + (size_t)y * stride;
+				uint8_t *dst = c->pw_scratch.data() + (size_t)y * w * 4;
+				for (uint32_t x = 0; x < w; x++) {
+					uint16_t v = (uint16_t)(sr[x * 2] | (sr[x * 2 + 1] << 8));
+					dst[x * 4 + 0] = (uint8_t)(((v & 0x001f) << 3) | ((v >> 2) & 7));
+					dst[x * 4 + 1] = (uint8_t)(((v & 0x07e0) >> 3) | ((v >> 9) & 3));
+					dst[x * 4 + 2] = (uint8_t)(((v & 0xf800) >> 8) | ((v >> 13) & 7));
+					dst[x * 4 + 3] = 255;
+				}
+			}
+			c->publish(c->pw_scratch.data(), w, h, w * 4, false);
+			break;
+		}
+		case SPA_VIDEO_FORMAT_YUY2: {
+			// BT.601 YUV 4:2:2 packed -> BGRA
+			c->pw_scratch.resize((size_t)w * h * 4);
+			for (uint32_t y = 0; y < h; y++) {
+				const uint8_t *sr = data + (size_t)y * stride;
+				uint8_t *dst = c->pw_scratch.data() + (size_t)y * w * 4;
+				for (uint32_t x = 0; x < w; x += 2) {
+					int y0 = sr[x * 2] - 16, y1 = sr[x * 2 + 2] - 16;
+					int u = sr[x * 2 + 1] - 128, v = sr[x * 2 + 3] - 128;
+					int r = (298 * y0 + 409 * v + 128) >> 8;
+					int g0 = (298 * y0 - 100 * u - 208 * v + 128) >> 8;
+					int g1 = (298 * y1 - 100 * u - 208 * v + 128) >> 8;
+					int b = (298 * y0 + 516 * u + 128) >> 8;
+					int r1 = (298 * y1 + 409 * v + 128) >> 8;
+					int b1 = (298 * y1 + 516 * u + 128) >> 8;
+					dst[x * 4 + 0] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
+					dst[x * 4 + 1] = (uint8_t)(g0 < 0 ? 0 : g0 > 255 ? 255 : g0);
+					dst[x * 4 + 2] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+					dst[x * 4 + 3] = 255;
+					dst[x * 4 + 4] = (uint8_t)(b1 < 0 ? 0 : b1 > 255 ? 255 : b1);
+					dst[x * 4 + 5] = (uint8_t)(g1 < 0 ? 0 : g1 > 255 ? 255 : g1);
+					dst[x * 4 + 6] = (uint8_t)(r1 < 0 ? 0 : r1 > 255 ? 255 : r1);
+					dst[x * 4 + 7] = 255;
+				}
+			}
+			c->publish(c->pw_scratch.data(), w, h, w * 4, false);
+			break;
+		}
+		default:
+			P("pw frame: unsupported format %u\n", fmt);
+			break;
+		}
+	}
+
+	std::vector<uint8_t> pw_scratch;
 
 	// ---- real capture ----------------------------------------------------
 	bool
@@ -364,7 +456,7 @@ void
 		auto create_shm = [&](uint32_t w, uint32_t h, uint32_t stride, uint32_t format) -> bool {
 			destroy_shm();
 			size_t one = (size_t)stride * h;
-			s.pool_size = one * 2;
+			s.pool_size = one; // grim-parity: exact-size pool, single buffer at 0
 			s.fd = memfd_create("rokid-screen-shm", 0);
 			if (s.fd < 0 || ftruncate(s.fd, (off_t)s.pool_size) != 0) {
 				P("memfd/ftruncate failed\n");
@@ -377,7 +469,7 @@ void
 			}
 			s.pool = wl_shm_create_pool(g.shm, s.fd, (int32_t)s.pool_size);
 			s.buf[0] = wl_shm_pool_create_buffer(s.pool, 0, w, h, stride, (wl_shm_format)format);
-			s.buf[1] = wl_shm_pool_create_buffer(s.pool, one, w, h, stride, (wl_shm_format)format);
+			s.buf[1] = nullptr; // single buffer (grim-parity); [1] kept null
 			s.w = w;
 			s.h = h;
 			s.stride = stride;
@@ -440,10 +532,19 @@ void
 				continue;
 			}
 
-			P("frame params: format=0x%08x %ux%u stride=%u\n", fs.format, fs.w, fs.h, fs.stride);
+			P("frame params: format=0x%08x %ux%u stride=%u (frame id=%u shm id=%u mgr id=%u)\n",
+			  fs.format, fs.w, fs.h, fs.stride, wl_proxy_get_id((wl_proxy *)frame),
+			  g.shm ? wl_proxy_get_id((wl_proxy *)g.shm) : 0, g.mgr ? wl_proxy_get_id((wl_proxy *)g.mgr) : 0);
+			// niri/smithay sends DRM fourccs (e.g. XR24=0x34325258) without
+			// the >=0x80000000 convention - map the common ones to wl_shm enums
+			uint32_t wl_fmt = fs.format;
+			if (wl_fmt == 0x34325258)
+				wl_fmt = WL_SHM_FORMAT_XRGB8888; // 1
+			else if (wl_fmt == 0x34324142)
+				wl_fmt = WL_SHM_FORMAT_ARGB8888; // 0
 			if (fs.stride * fs.h > 0 &&
-			    (fs.w != s.w || fs.h != s.h || fs.stride != s.stride || fs.format != s.format)) {
-				if (!create_shm(fs.w, fs.h, fs.stride, fs.format)) {
+			    (fs.w != s.w || fs.h != s.h || fs.stride != s.stride || wl_fmt != s.format)) {
+				if (!create_shm(fs.w, fs.h, fs.stride, wl_fmt)) {
 					P("shm setup failed\n");
 					zwlr_screencopy_frame_v1_destroy(frame);
 					goto out;
@@ -454,8 +555,7 @@ void
 				wl_display_flush(disp);
 			}
 
-			cur_idx ^= 1;
-			cur_buf = s.buf[cur_idx];
+			cur_buf = s.buf[0];
 			zwlr_screencopy_frame_v1_copy(frame, cur_buf);
 
 			// wait for ready
@@ -471,6 +571,8 @@ void
 				const uint8_t *src = s.map + (size_t)cur_idx * (size_t)s.stride * s.h;
 				consecutive_failures = 0;
 				bool r_first = (s.format == WL_SHM_FORMAT_ABGR8888 || s.format == WL_SHM_FORMAT_XBGR8888);
+				if (env_flag("ROKID_SCREEN_SWAP_RB", true))
+					r_first = !r_first; // default swap: correct with the .bgr shader; =0 restores
 				publish(src, s.w, s.h, s.stride, r_first);
 				if (++dbg_frames % 60 == 0) {
 					uint32_t mn = 255, mx = 0;
@@ -866,7 +968,7 @@ struct Renderer {
 		free_texture();
 		VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
 		ii.imageType = VK_IMAGE_TYPE_2D;
-		ii.format = VK_FORMAT_B8G8R8A8_UNORM;
+		ii.format = format; // same as swapchain (SRGB sampling = identity)
 		ii.extent = {w, h, 1};
 		ii.mipLevels = 1;
 		ii.arrayLayers = 1;
@@ -886,7 +988,7 @@ struct Renderer {
 		VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
 		vi.image = tex;
 		vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-		vi.format = VK_FORMAT_B8G8R8A8_UNORM;
+		vi.format = format;
 		vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 		if (vkCreateImageView(device, &vi, nullptr, &tex_view) != VK_SUCCESS)
 			return false;
@@ -1017,8 +1119,15 @@ struct Eye {
 };
 
 int
-main(int, char **)
+main(int argc, char **argv)
 {
+	if (argc > 1 && strcmp(argv[1], "--portal-test") == 0) {
+		signal(SIGINT, on_sigint);
+		long node = portal::screencast_node(true);
+		if (node >= 0)
+			pwcap::capture_stats((uint32_t)node, true);
+		return 0;
+	}
 	signal(SIGINT, on_sigint);
 	signal(SIGTERM, on_sigint);
 
@@ -1165,9 +1274,11 @@ main(int, char **)
 		int64_t force = 0;
 		if (const char *fe = getenv("ROKID_SCREEN_FORMAT"))
 			force = atoll(fe);
-		const int64_t prefer[] = {force ? force : VK_FORMAT_B8G8R8A8_UNORM,
-		                          force ? force : VK_FORMAT_B8G8R8A8_SRGB,
-		                          VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
+		// SRGB default: the comp then samples sRGB-encoded content correctly
+		// (UNORM content gets treated as linear -> washed-out/low contrast)
+		const int64_t prefer[] = {force ? force : VK_FORMAT_B8G8R8A8_SRGB,
+		                          force ? force : VK_FORMAT_B8G8R8A8_UNORM,
+		                          VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM};
 		for (int64_t p : prefer) {
 			for (int64_t f : fmts) {
 				if (f == p) {
